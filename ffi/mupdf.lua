@@ -791,6 +791,98 @@ function page_mt.__index:getMarkupAnnotation(points, n)
     return nil
 end
 
+function page_mt.__index:getAnnotationColor(annot)
+    local n = ffi.new("int[1]")
+    local color = ffi.new("float[4]")
+
+    --local file_path = "/storage/emulated/0/Books/test/annotations2.txt"  
+    --local file = io.open(file_path, "w") 
+
+    
+    W.mupdf_pdf_annot_color(self.ctx, annot, n, color)
+
+    local annot_color = {}
+    for i = 1, n[0] do
+        annot_color[i] = color[i-1]
+        --file:write(string.format("%f\n",annot_color[i] ))
+    end
+
+    --file:close()
+
+    return annot_color
+end
+
+function page_mt.__index:getAnnotationText(annot)
+    local text = ffi.string(W.mupdf_pdf_annot_contents(self.ctx, annot))
+    --local file_path = "/storage/emulated/0/Books/test/anno_highlight_text.txt"  
+    --local file = io.open(file_path, "w") 
+    --file:write((text and text or "empty") .. "\n")
+    --file:close()
+
+    return text
+end
+
+function page_mt.__index:setAnnotationAuthor(annot, contents)
+    local ok = W.mupdf_pdf_set_annot_author(self.ctx, annot, contents)
+    if ok == nil then merror("could not set anot author") end
+end
+
+function page_mt.__index:getAllMarkupAnnotation()
+    local annot = W.mupdf_pdf_first_annot(self.ctx, ffi.cast("pdf_page*", self.page))
+
+    local all_annots = {}
+    local count = 0
+    while annot ~= nil do
+        -- n2 = the number of quadpoints of annot
+        local n2 = W.mupdf_pdf_annot_quad_point_count(self.ctx, annot)
+
+        if (n2 > 0)  then
+            local points = {}
+            local quadpoint = ffi.new("fz_quad[1]")
+
+            for i = 0, n2-1 do
+                -- read point i to quadpoint
+                W.mupdf_pdf_annot_quad_point(self.ctx, annot, i, quadpoint)
+                local point_data = {
+                    ul = {x = quadpoint[0].ul.x, y = quadpoint[0].ul.y},
+                    ur = {x = quadpoint[0].ur.x, y = quadpoint[0].ur.y},
+                    ll = {x = quadpoint[0].ll.x, y = quadpoint[0].ll.y},
+                    lr = {x = quadpoint[0].lr.x, y = quadpoint[0].lr.y},
+                }
+                table.insert(points, point_data)
+            end
+
+            local annot_color = self:getAnnotationColor(annot)
+            local file_path = "/storage/emulated/0/Books/test/annotations1.txt"  
+            local file = io.open(file_path, "w") 
+            file:write("Annotation " .. (count + 1) .. ":\n")
+            for j = 1, #annot_color do
+                annot_color[j] =  annot_color[j] * 255
+                file:write(string.format("%f\n",annot_color[j]))
+            end
+            file:close()
+
+            local annot_text = self:getAnnotationText(annot)
+            local annotation1 = {
+                quadpoints = points,
+                color = annot_color,
+                text = annot_text
+            }
+            table.insert(all_annots, annotation1)
+        end
+
+        annot = W.mupdf_pdf_next_annot(self.ctx, annot)
+        count = count + 1
+    end
+
+    return all_annots
+    --file:write("\nAbsolute path to this file: " .. file_path .. "\n")
+    --local count_str = tostring(count)
+    --local lfs = require("lfs") -- Lua File System, nếu được hỗ trợ
+    --local file_path_abs = lfs.currentdir() .. "/annotations.txt"
+    --return file_path
+end
+
 function page_mt.__index:updateMarkupAnnotation(annot, contents)
     local ok = W.mupdf_pdf_set_annot_contents(self.ctx, annot, contents)
     if ok == nil then merror(self.ctx, "could not update markup annot contents") end

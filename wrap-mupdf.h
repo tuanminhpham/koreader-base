@@ -186,4 +186,13 @@ MUPDF_WRAP(mupdf_new_buffer_from_shared_data, fz_buffer*, NULL,
 MUPDF_WRAP(mupdf_drop_buffer, void*, NULL,
     { fz_drop_buffer(ctx, buf); ret = (void*) -1; },
     fz_buffer *buf)
+MUPDF_WRAP(mupdf_pdf_annot_color, void*, NULL,
+        { pdf_annot_color(ctx, annot, n, color); ret = (void*) -1; },
+       pdf_annot *annot, int *n, float color[4])
+MUPDF_WRAP(mupdf_pdf_set_annot_author, void*, NULL,
+    { pdf_set_annot_author(ctx, annot, text); ret = (void*) -1; },
+     pdf_annot *annot, const char *text)    
+MUPDF_WRAP(mupdf_pdf_annot_contents, const char *, NULL,
+     ret = pdf_annot_contents(ctx, annot),
+    pdf_annot *annot)
 
