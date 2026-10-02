@@ -690,8 +690,27 @@ local function run_page(page, pixmap, ctm, background_cleanup)
         dev = transparency_mask_dev
     end
 
-    local ok = W.mupdf_run_page(page.ctx, page.page, dev, ctm, nil)
-               and W.mupdf_close_device(page.ctx, dev)
+    local filters = page.doc.annotation_render_filter and page.doc.annotation_render_filter[page.number]
+    local skip, skip_count
+    if page.doc.annotation_render_errors then page.doc.annotation_render_errors[page.number] = nil end
+    if filters and #filters > 0 then
+        skip, skip_count = ffi.new("pdf_annot *[?]", #filters), 0
+        local errors = {}
+        for _, part in ipairs(filters) do
+            local ok, annot, reason = pcall(page.resolveEmbeddedAnnotation, page, part)
+            if ok and annot then skip[skip_count], skip_count = annot, skip_count + 1
+            else errors[#errors + 1] = ok and reason or tostring(annot) end
+        end
+        page.doc.annotation_render_errors = page.doc.annotation_render_errors or {}
+        page.doc.annotation_render_errors[page.number] = #errors > 0 and errors or nil
+    end
+    local ok
+    if skip_count and skip_count > 0 then
+        ok = W.mupdf_run_page_filtered(page.ctx, page.page, dev, ctm, nil, skip, skip_count)
+    else
+        ok = W.mupdf_run_page(page.ctx, page.page, dev, ctm, nil)
+    end
+    ok = ok and W.mupdf_close_device(page.ctx, dev)
 
     M.fz_drop_device(page.ctx, dev)
 
@@ -908,35 +927,212 @@ function page_mt.__index:updateMarkupAnnotation(annot, contents)
     if not ok then merror(self.ctx, "could not update markup annot contents") end
 end
 
+-- Snapshot the current in-memory PDF without finalizing its incremental xref.
+-- The caller owns staging, fsync, reopen verification, and paired sidecar commit.
+function document_mt.__index:saveSnapshot(filename)
+    assert(filename ~= self.filename, "snapshot must use a separate file")
+    if not W.mupdf_pdf_save_snapshot(self.ctx, self.doc, filename) then
+        merror(self.ctx, "could not snapshot PDF")
+    end
+end
+
+local function annotation_string(value)
+    if value == nil then return nil end
+    local text = ffi.string(value)
+    return text ~= "" and text or nil
+end
+
+local function annotation_raw_equal(a, b)
+    if type(a) ~= type(b) then return false end
+    if type(a) == "number" then return math.abs(a - b) <= 0.0001 end
+    if type(a) ~= "table" then return a == b end
+    for key, value in pairs(a) do
+        if not annotation_raw_equal(value, b[key]) then return false end
+    end
+    for key in pairs(b) do
+        if a[key] == nil then return false end
+    end
+    return true
+end
+
+local function read_source_annotation(page, annot)
+    local ctx = page.ctx
+    local annot_type = W.mupdf_pdf_annot_type(ctx, annot)
+    if annot_type < 8 or annot_type > 11 then return nil end
+    local count = W.mupdf_pdf_annot_quad_point_count(ctx, annot)
+    if count < 0 then merror(ctx, "could not read annotation quads") end
+    if count == 0 then return nil, "empty quadpoints" end
+    local raw = { type = annot_type, quads = {} }
+    local boxes = {}
+    local quad = ffi.new("fz_quad[1]")
+    local bounds = ffi.new("fz_rect")
+    for i = 0, count - 1 do
+        if not W.mupdf_pdf_annot_quad_point(ctx, annot, i, quad) then
+            merror(ctx, "could not read annotation quad")
+        end
+        local q = quad[0]
+        local data = { q.ul.x, q.ul.y, q.ur.x, q.ur.y, q.ll.x, q.ll.y, q.lr.x, q.lr.y }
+        for _, value in ipairs(data) do
+            if value ~= value or math.abs(value) == math.huge then
+                return nil, "non-finite quadpoints"
+            end
+        end
+        W.mupdf_fz_rect_from_quad(bounds, quad)
+        if bounds.x1 <= bounds.x0 or bounds.y1 <= bounds.y0 then
+            return nil, "empty quad bounds"
+        end
+        raw.quads[#raw.quads + 1] = data
+        boxes[#boxes + 1] = { x = bounds.x0, y = bounds.y0,
+            w = bounds.x1 - bounds.x0 + 1, h = bounds.y1 - bounds.y0 + 1 }
+    end
+    local n = ffi.new("int[1]")
+    local color = ffi.new("float[4]")
+    local rgb = ffi.new("float[3]")
+    if not W.mupdf_pdf_annot_color_info(ctx, annot, n, color, rgb) then
+        merror(ctx, "could not read annotation color")
+    end
+    raw.color_n, raw.color_components = n[0], {}
+    for i = 0, n[0] - 1 do raw.color_components[i + 1] = color[i] end
+    raw.contents = annotation_string(W.mupdf_pdf_annot_contents(ctx, annot))
+    raw.author = annotation_string(W.mupdf_pdf_annot_author(ctx, annot))
+    raw.rich_contents = annotation_string(W.mupdf_pdf_annot_rich_contents(ctx, annot))
+    local flags, opacity = ffi.new("int[1]"), ffi.new("float[1]")
+    local creation, modification = ffi.new("int64_t[1]"), ffi.new("int64_t[1]")
+    if not W.mupdf_pdf_annot_details(ctx, annot, flags, opacity, creation, modification) then
+        merror(ctx, "could not read annotation details")
+    end
+    raw.flags, raw.opacity = flags[0], opacity[0]
+    raw.creation_date, raw.modification_date = tonumber(creation[0]), tonumber(modification[0])
+    local num, gen = ffi.new("int[1]"), ffi.new("int[1]")
+    if not W.mupdf_pdf_annot_identity(ctx, annot, num, gen) then
+        merror(ctx, "could not read annotation identity")
+    end
+    return { boxes = boxes, type = raw.type, contents = raw.contents, author = raw.author,
+        quads = raw.quads, color_n = raw.color_n, color_components = raw.color_components,
+        color_rgb = n[0] > 0 and { rgb[0], rgb[1], rgb[2] } or nil,
+        source = { num = num[0], gen = gen[0] }, raw = raw }
+end
+
+-- Only serializable values leave this function. An invalid annotation is reported
+-- separately, never committed as a malformed item by an importing caller.
 function page_mt.__index:getEmbeddedAnnotations()
-    local annotations = {}
+    local annotations, rejected = {}, {}
     local annot = W.mupdf_pdf_first_annot(self.ctx, ffi.cast("pdf_page*", self.page))
     while annot ~= nil do
-        local annot_type = W.mupdf_pdf_annot_type(self.ctx, annot)
-        -- markup annotations: highlight=8, underline=9, squiggly=10, strikeout=11
-        if annot_type >= 8 and annot_type <= 11 then
-            local annot_boxes = {}
-            local quadpoint = ffi.new("fz_quad[1]")
-            local point_count = W.mupdf_pdf_annot_quad_point_count(self.ctx, annot)
-            for i = 0, point_count - 1 do
-                W.mupdf_pdf_annot_quad_point(self.ctx, annot, i, quadpoint)
-                table.insert(annot_boxes, {
-                    h = quadpoint[0].ll.y - quadpoint[0].ul.y + 1,
-                    w = quadpoint[0].ur.x - quadpoint[0].ul.x + 1,
-                    x = quadpoint[0].ul.x,
-                    y = quadpoint[0].ul.y,
-                })
+        local entry, reason = read_source_annotation(self, annot)
+        if entry then annotations[#annotations + 1] = entry
+        elseif reason then rejected[#rejected + 1] = reason end
+        annot = W.mupdf_pdf_next_annot(self.ctx, annot)
+    end
+    return next(annotations) and annotations or nil, rejected
+end
+
+-- A pointer is borrowed only for this open page's lifetime. A same-ID changed
+-- source is a conflict; rewritten IDs may fall back to ONE complete raw match.
+function page_mt.__index:resolveEmbeddedAnnotation(part)
+    if type(part) ~= "table" or type(part.raw) ~= "table" then
+        return nil, "source snapshot missing"
+    end
+    local found, found_entry, matches = nil, nil, 0
+    local annot = W.mupdf_pdf_first_annot(self.ctx, ffi.cast("pdf_page*", self.page))
+    while annot ~= nil do
+        local entry = read_source_annotation(self, annot)
+        if entry then
+            local same = annotation_raw_equal(part.raw, entry.raw)
+            if part.num and part.num > 0 and entry.source.num == part.num and entry.source.gen == part.gen then
+                if same then return annot, entry end
+                return nil, "source annotation changed externally"
             end
-            local contents = W.mupdf_pdf_annot_contents(self.ctx, annot)
-            table.insert(annotations, {
-                boxes = annot_boxes,
-                type = annot_type,
-                contents = contents ~= nil and ffi.string(contents) or nil,
-            })
+            if same then found, found_entry, matches = annot, entry, matches + 1 end
         end
         annot = W.mupdf_pdf_next_annot(self.ctx, annot)
     end
-    return next(annotations) and annotations
+    if matches == 1 then return found, found_entry end
+    return nil, matches == 0 and "source annotation missing" or "ambiguous source annotations"
+end
+
+local function annotation_part(entry, page_number)
+    return { page = page_number, num = entry.source.num, gen = entry.source.gen, raw = entry.raw }
+end
+
+local function annotation_quads(quads)
+    assert(type(quads) == "table" and #quads > 0, "annotation requires quadpoints")
+    local points = ffi.new("fz_quad[?]", #quads)
+    for i, q in ipairs(quads) do
+        assert(#q == 8, "annotation quad requires eight coordinates")
+        for _, value in ipairs(q) do
+            assert(type(value) == "number" and value == value and math.abs(value) < math.huge,
+                "annotation coordinates must be finite")
+        end
+        local p = points[i - 1]
+        p.ul.x, p.ul.y, p.ur.x, p.ur.y = q[1], q[2], q[3], q[4]
+        p.ll.x, p.ll.y, p.lr.x, p.lr.y = q[5], q[6], q[7], q[8]
+    end
+    return points, #quads
+end
+
+local function apply_annotation_changes(page, annot, changes)
+    local ctx = page.ctx
+    local function check(ok, action)
+        if not ok then merror(ctx, "could not " .. action .. " source annotation") end
+    end
+    if changes.type then check(W.mupdf_pdf_set_markup_type(ctx, annot, changes.type), "change type of") end
+    if changes.quads then
+        local points, count = annotation_quads(changes.quads)
+        check(W.mupdf_pdf_set_annot_quad_points(ctx, annot, count, points), "change quads of")
+    end
+    if changes.color_n ~= nil then
+        assert(changes.color_n == 0 or changes.color_n == 1 or changes.color_n == 3 or changes.color_n == 4,
+            "unsupported annotation color components")
+        local color = ffi.new("float[4]")
+        for i = 1, changes.color_n do color[i - 1] = assert(changes.color_components[i]) end
+        check(W.mupdf_pdf_set_annot_color(ctx, annot, changes.color_n, color), "change color of")
+    end
+    if changes.contents ~= nil then
+        check(W.mupdf_pdf_set_annot_contents(ctx, annot, changes.contents), "change contents of")
+    end
+    if changes.author ~= nil then
+        check(W.mupdf_pdf_set_annot_author(ctx, annot, changes.author), "change author of")
+    end
+    if changes.rich_contents ~= nil then
+        check(W.mupdf_pdf_set_annot_rich_contents(ctx, annot, changes.contents or "", changes.rich_contents),
+            "change rich contents of")
+    end
+    if changes.flags ~= nil then
+        check(W.mupdf_pdf_set_annot_details(ctx, annot, changes.flags, changes.opacity or 1,
+            changes.creation_date or 0, changes.modification_date or 0), "change details of")
+    end
+    check(W.mupdf_pdf_update_annot(ctx, annot), "update appearance of")
+end
+
+-- Use only on an independent candidate document. Callers own whole-transaction
+-- rollback; a native exception must never lead to saving a partially edited candidate.
+function page_mt.__index:updateEmbeddedAnnotation(part, changes)
+    local annot, reason = self:resolveEmbeddedAnnotation(part)
+    if not annot then error(reason) end
+    apply_annotation_changes(self, annot, changes)
+    return annotation_part(assert(read_source_annotation(self, annot)), self.number)
+end
+
+function page_mt.__index:createEmbeddedAnnotation(raw)
+    assert(raw.type and raw.type >= 8 and raw.type <= 11, "expected text markup annotation")
+    local annot = W.mupdf_pdf_create_annot(self.ctx, ffi.cast("pdf_page*", self.page), raw.type)
+    if annot == nil then merror(self.ctx, "could not create source annotation") end
+    apply_annotation_changes(self, annot, raw)
+    return annotation_part(assert(read_source_annotation(self, annot)), self.number)
+end
+
+function page_mt.__index:deleteEmbeddedAnnotation(part)
+    local annot, reason = self:resolveEmbeddedAnnotation(part)
+    if not annot then error(reason) end
+    self:deleteAnnotation(annot)
+    return true
+end
+
+function page_mt.__index:setAnnotationAuthor(annot, author)
+    if not W.mupdf_pdf_set_annot_author(self.ctx, annot, author) then
+        merror(self.ctx, "could not set annotation author")
+    end
 end
 
 -- image loading via MuPDF:

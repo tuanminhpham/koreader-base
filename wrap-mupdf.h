@@ -44,6 +44,14 @@ DLL_PUBLIC fz_rect *mupdf_fz_union_rect(fz_rect *a, const fz_rect *b);
 DLL_PUBLIC fz_rect *mupdf_fz_rect_from_quad(fz_rect *r, const fz_quad *q);
 DLL_PUBLIC fz_rect *mupdf_fz_bound_page(fz_context *ctx, fz_page *page, fz_rect *r);
 
+// Render with borrowed annotation pointers resolved on this very page. Never persist pointers.
+DLL_PUBLIC bool mupdf_run_page_filtered(fz_context *ctx, fz_page *page, fz_device *dev,
+    const fz_matrix *transform, fz_cookie *cookie, pdf_annot *const *skip, int count);
+DLL_PUBLIC bool mupdf_pdf_annot_color_info(fz_context *ctx, pdf_annot *annot,
+    int *n, float components[4], float rgb[3]);
+DLL_PUBLIC bool mupdf_pdf_annot_identity(fz_context *ctx, pdf_annot *annot, int *num, int *gen);
+DLL_PUBLIC bool mupdf_pdf_set_markup_type(fz_context *ctx, pdf_annot *annot, int type);
+
 // this will turn the wrappers defined below into their declarations
 #define MUPDF_WRAP(wrapper_name, ret_type, failure_value, call, ...) \
     DLL_PUBLIC ret_type wrapper_name(fz_context *ctx, ##__VA_ARGS__);
@@ -216,3 +224,27 @@ MUPDF_WRAP(mupdf_new_buffer_from_shared_data, fz_buffer*, NULL,
     ret = fz_new_buffer_from_shared_data(ctx, data, size),
     const unsigned char *data, size_t size)
 
+
+// KOReaderX source annotation metadata. Every exception stays on the C side of FFI.
+MUPDF_WRAP(mupdf_pdf_annot_author, const char*, NULL,
+    ret = pdf_annot_author(ctx, annot), pdf_annot *annot)
+MUPDF_WRAP(mupdf_pdf_annot_rich_contents, const char*, NULL,
+    ret = pdf_annot_rich_contents(ctx, annot), pdf_annot *annot)
+MUPDF_WRAP_BOOL(mupdf_pdf_set_annot_author,
+    pdf_set_annot_author(ctx, annot, author), pdf_annot *annot, const char *author)
+MUPDF_WRAP_BOOL(mupdf_pdf_set_annot_rich_contents,
+    pdf_set_annot_rich_contents(ctx, annot, plain, rich),
+    pdf_annot *annot, const char *plain, const char *rich)
+MUPDF_WRAP_BOOL(mupdf_pdf_annot_details,
+    { *flags = pdf_annot_flags(ctx, annot); *opacity = pdf_annot_opacity(ctx, annot);
+      *creation = pdf_annot_creation_date(ctx, annot); *modification = pdf_annot_modification_date(ctx, annot); },
+    pdf_annot *annot, int *flags, float *opacity, int64_t *creation, int64_t *modification)
+MUPDF_WRAP_BOOL(mupdf_pdf_set_annot_details,
+    { pdf_set_annot_flags(ctx, annot, flags); pdf_set_annot_opacity(ctx, annot, opacity);
+      pdf_set_annot_creation_date(ctx, annot, creation); pdf_set_annot_modification_date(ctx, annot, modification); },
+    pdf_annot *annot, int flags, float opacity, int64_t creation, int64_t modification)
+MUPDF_WRAP_BOOL(mupdf_pdf_save_snapshot,
+    { pdf_document *pdf = pdf_document_from_fz_document(ctx, doc);
+      if (!pdf) fz_throw(ctx, FZ_ERROR_ARGUMENT, "snapshot requires PDF");
+      pdf_save_snapshot(ctx, pdf, filename); },
+    fz_document *doc, const char *filename)

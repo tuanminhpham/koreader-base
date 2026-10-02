@@ -266,3 +266,99 @@ int page_has_transparency_mask(fz_context* ctx, fz_page* p)
 
 #define MUPDF_DO_WRAP
 #include "wrap-mupdf.h"
+
+
+// Full fz_run_page order, replacing only the PDF annotation phase. The pointer
+// array is borrowed from the caller's currently open page, never an object ID.
+DLL_PUBLIC bool
+mupdf_run_page_filtered(fz_context *ctx, fz_page *page, fz_device *dev,
+    const fz_matrix *transform, fz_cookie *cookie, pdf_annot *const *skip, int count)
+{
+    fz_try(ctx)
+    {
+        if (!count) {
+            fz_run_page(ctx, page, dev, *transform, cookie);
+        } else {
+            pdf_page *pdfpage = pdf_page_from_fz_page(ctx, page);
+            if (!pdfpage) fz_throw(ctx, FZ_ERROR_ARGUMENT, "annotation filter requires PDF");
+            fz_run_page_contents(ctx, page, dev, *transform, cookie);
+            fz_try(ctx)
+            {
+                pdf_update_page(ctx, pdfpage);
+                if (cookie && cookie->progress_max != (size_t)-1) {
+                    int total = 1;
+                    for (pdf_annot *a = pdf_first_annot(ctx, pdfpage); a; a = pdf_next_annot(ctx, a))
+                        ++total;
+                    cookie->progress_max += total;
+                }
+                for (pdf_annot *a = pdf_first_annot(ctx, pdfpage); a; a = pdf_next_annot(ctx, a)) {
+                    if (cookie) {
+                        if (cookie->abort) break;
+                        ++cookie->progress;
+                    }
+                    bool hidden = false;
+                    for (int i = 0; i < count; ++i)
+                        if (a == skip[i]) { hidden = true; break; }
+                    if (!hidden) pdf_run_annot(ctx, a, dev, *transform, cookie);
+                }
+            }
+            fz_catch(ctx)
+            {
+                dev->close_device = NULL;
+                fz_rethrow_unless(ctx, FZ_ERROR_ABORT);
+                fz_ignore_error(ctx);
+            }
+            fz_run_page_widgets(ctx, page, dev, *transform, cookie);
+        }
+    }
+    fz_catch(ctx) { return false; }
+    return true;
+}
+
+DLL_PUBLIC bool
+mupdf_pdf_annot_color_info(fz_context *ctx, pdf_annot *annot,
+    int *n, float components[4], float rgb[3])
+{
+    fz_try(ctx)
+    {
+        pdf_annot_color(ctx, annot, n, components);
+        if (*n != 0) {
+            fz_colorspace *src = *n == 1 ? fz_device_gray(ctx) :
+                *n == 3 ? fz_device_rgb(ctx) : *n == 4 ? fz_device_cmyk(ctx) : NULL;
+            if (!src) fz_throw(ctx, FZ_ERROR_ARGUMENT, "unsupported annotation color");
+            fz_convert_color(ctx, src, components, fz_device_rgb(ctx), rgb, NULL, fz_default_color_params);
+        }
+    }
+    fz_catch(ctx) { return false; }
+    return true;
+}
+
+DLL_PUBLIC bool
+mupdf_pdf_annot_identity(fz_context *ctx, pdf_annot *annot, int *num, int *gen)
+{
+    fz_try(ctx)
+    {
+        pdf_obj *obj = pdf_annot_obj(ctx, annot);
+        *num = pdf_to_num(ctx, obj);
+        *gen = pdf_to_gen(ctx, obj);
+    }
+    fz_catch(ctx) { return false; }
+    return true;
+}
+
+DLL_PUBLIC bool
+mupdf_pdf_set_markup_type(fz_context *ctx, pdf_annot *annot, int type)
+{
+    fz_try(ctx)
+    {
+        if (type < PDF_ANNOT_HIGHLIGHT || type > PDF_ANNOT_STRIKE_OUT)
+            fz_throw(ctx, FZ_ERROR_ARGUMENT, "expected text markup annotation type");
+        // These four subtypes have the same QuadPoints contract. Change in place
+        // so third-party keys, author, dates, opacity and references survive.
+        pdf_dict_put_name(ctx, pdf_annot_obj(ctx, annot), PDF_NAME(Subtype),
+            pdf_string_from_annot_type(ctx, type));
+        pdf_dirty_annot(ctx, annot);
+    }
+    fz_catch(ctx) { return false; }
+    return true;
+}

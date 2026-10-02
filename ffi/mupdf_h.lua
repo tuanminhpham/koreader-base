@@ -325,4 +325,15 @@ fz_rect *mupdf_fz_transform_rect(fz_rect *, const fz_matrix *);
 fz_irect *mupdf_fz_round_rect(fz_irect *, const fz_rect *);
 fz_rect *mupdf_fz_union_rect(fz_rect *, const fz_rect *);
 fz_rect *mupdf_fz_rect_from_quad(fz_rect *, const fz_quad *);
+bool mupdf_run_page_filtered(fz_context *, fz_page *, fz_device *, const fz_matrix *, fz_cookie *, pdf_annot *const *, int);
+bool mupdf_pdf_annot_color_info(fz_context *, pdf_annot *, int *, float[4], float[3]);
+bool mupdf_pdf_annot_identity(fz_context *, pdf_annot *, int *, int *);
+bool mupdf_pdf_set_markup_type(fz_context *, pdf_annot *, int);
+const char *mupdf_pdf_annot_author(fz_context *, pdf_annot *);
+const char *mupdf_pdf_annot_rich_contents(fz_context *, pdf_annot *);
+bool mupdf_pdf_set_annot_author(fz_context *, pdf_annot *, const char *);
+bool mupdf_pdf_set_annot_rich_contents(fz_context *, pdf_annot *, const char *, const char *);
+bool mupdf_pdf_annot_details(fz_context *, pdf_annot *, int *, float *, int64_t *, int64_t *);
+bool mupdf_pdf_set_annot_details(fz_context *, pdf_annot *, int, float, int64_t, int64_t);
+bool mupdf_pdf_save_snapshot(fz_context *, fz_document *, const char *);
 ]]
