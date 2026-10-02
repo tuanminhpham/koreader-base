@@ -17,18 +17,20 @@ describe("KOReaderX PDF source annotations", function()
          local bb=page:draw_new(dc,math.ceil(w),math.ceil(h),0,0)
          local result=ffi.string(bb.data,bb.stride*bb.h);bb:free();return result
         end
-        local function pdf_fixture(path, empty_quads)
+        local function pdf_fixture(path, empty_quads, relationship)
          local objects={
           '<< /Type /Catalog /Pages 2 0 R /AcroForm << /Fields [8 0 R] >> >>',
           '<< /Type /Pages /Kids [3 0 R 4 0 R] /Count 2 >>',
           '<< /Type /Page /Parent 2 0 R /MediaBox [0 0 400 500] /Contents 5 0 R /Resources << >> /Annots [6 0 R 7 0 R 8 0 R] >>',
           '<< /Type /Page /Parent 2 0 R /MediaBox [0 0 400 500] /Contents 5 0 R /Resources << >> >>',
           '<< /Length 0 >>\nstream\n\nendstream',
-          '<< /Type /Annot /Subtype /Highlight /Rect [30 450 140 470] /QuadPoints [30 470 140 470 30 450 140 450] /C [1 1 0] /CA 0.5 /F 4 /T (source-author) /Contents (source-note) /CreationDate (D:20260101000000Z) /M (D:20260102000000Z) /XCustom (keep-foreign-value) >>',
+          '<< /Type /Annot /Subtype /Highlight /Rect [30 450 140 470] /QuadPoints [30 470 140 470 30 450 140 450] /C [1 1 0] /CA 0.5 /F 4 /T (source-author) /Contents (source-note) /CreationDate (D:20260101000000Z) /M (D:20260102000000Z) /XCustom (keep-foreign-value) /XDict << /Nested (keep-dict-value) >> /XRef 10 0 R >>',
           '<< /Type /Annot /Subtype /Underline /Rect [30 350 140 370] /QuadPoints [30 370 140 370 30 350 140 350] /C [0 1 0] /CA 1 /F 4 /T (neighbor-author) /Contents (neighbor-note) >>',
           '<< /Type /Annot /Subtype /Widget /FT /Btn /T (fixture-button) /Rect [250 400 350 430] /P 3 0 R /F 4 /AP << /N 9 0 R >> >>',
           '<< /Type /XObject /Subtype /Form /BBox [0 0 100 30] /Resources << >> /Length 25 >>\nstream\n0 0 1 rg 0 0 100 30 re f\nendstream',
+          '<< /Tag (foreign-reference-value) >>',
          }
+         if relationship then objects[6] = objects[6]:sub(1,-3)..relationship..' >>' end
          if empty_quads then objects[6] = objects[6]:gsub('/QuadPoints %b[]', '/QuadPoints []') end
          local output='%PDF-1.7\n';local offsets={0}
          for i,obj in ipairs(objects) do offsets[i]=#output;output=output..i..' 0 obj\n'..obj..'\nendobj\n' end
@@ -88,6 +90,25 @@ describe("KOReaderX PDF source annotations", function()
         doc.annotation_render_filter={[1]={after_changed}}
         assert(#pixels(page)>0);assert(doc.annotation_render_errors[1][1])
         eq(bytes(fixture),initial,'all candidate and render tests keep source bytes')
+        local target_page = doc:openPage(2)
+        local template_raw = copy(part.raw)
+        template_raw.quads = {{40, 40, 140, 40, 40, 60, 140, 60}}
+        template_raw.contents = 'extended note'
+        template_raw.type = 11
+        local extended = target_page:createEmbeddedAnnotation(template_raw, part)
+        eq(extended.page, 2)
+        eq(extended.raw.type, 11)
+        eq(extended.raw.contents, 'extended note')
+        eq(extended.raw.author, part.raw.author)
+        target_page:close()
+        doc:writeDocument(work..'/template.pdf')
+        local template_bytes = bytes(work..'/template.pdf')
+        local _, copies = template_bytes:gsub('keep%-foreign%-value', '')
+        eq(copies, 2, 'foreign scalar retained on original and new page')
+        local _, dictionaries = template_bytes:gsub('keep%-dict%-value', '')
+        eq(dictionaries, 2, 'foreign dictionary retained on new page')
+        local _, references = template_bytes:gsub('/XRef', '')
+        eq(references, 2, 'foreign reference retained on new page')
         local ok_empty = pcall(page.updateEmbeddedAnnotation, page, part, {quads={}})
         eq(ok_empty, false, 'empty edit rejected before changing source')
         page:close();doc:close()
@@ -99,9 +120,23 @@ describe("KOReaderX PDF source annotations", function()
         eq(#valid_entries, 1, 'valid neighbor is still enumerated')
         eq(#invalid_entries, 1, 'zero-quad source is explicitly reported')
         invalid_page:close(); invalid_doc:close()
+        pdf_fixture(work..'/relationship.pdf', false, ' /IRT 7 0 R /RT /R')
+        local relationship_doc = M.openDocument(work..'/relationship.pdf')
+        local relationship_page = relationship_doc:openPage(1)
+        local relationship_entry = relationship_page:getEmbeddedAnnotations()[1]
+        local relationship_part = {page=1, num=relationship_entry.source.num,
+            gen=relationship_entry.source.gen, raw=relationship_entry.raw}
+        local relationship_target = relationship_doc:openPage(2)
+        local accepted, relationship_error = pcall(relationship_target.createEmbeddedAnnotation,
+            relationship_target, relationship_entry.raw, relationship_part)
+        eq(accepted, false, 'cross-page annotation relationships require explicit reconciliation')
+        assert(tostring(relationship_error):find('relationship /IRT', 1, true))
+        eq(relationship_target:getEmbeddedAnnotations(), nil, 'rejected relationship does not create a part')
+        relationship_target:close(); relationship_page:close(); relationship_doc:close()
+
         print('PASS native metadata RGB/gray/CMYK/no-color, UTF-8 author/note, identity/stale/ambiguous, snapshot pending edits, exact selective render including widget, tilted quad bounds, type/foreign-field/opacity/date roundtrip')
 
-        for _,name in ipairs({'source-fixture.pdf','snapshot.pdf','candidate.pdf','invalid.pdf'}) do os.remove(work..'/'..name) end
+        for _,name in ipairs({'source-fixture.pdf','snapshot.pdf','candidate.pdf','invalid.pdf','template.pdf','relationship.pdf'}) do os.remove(work..'/'..name) end
         assert(require('lfs').rmdir(work))
     end)
 end)

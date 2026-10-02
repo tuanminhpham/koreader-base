@@ -336,4 +336,5 @@ bool mupdf_pdf_set_annot_rich_contents(fz_context *, pdf_annot *, const char *, 
 bool mupdf_pdf_annot_details(fz_context *, pdf_annot *, int *, float *, int64_t *, int64_t *);
 bool mupdf_pdf_set_annot_details(fz_context *, pdf_annot *, int, float, int64_t, int64_t);
 bool mupdf_pdf_save_snapshot(fz_context *, fz_document *, const char *);
+pdf_annot *mupdf_pdf_create_annot_from(fz_context *, pdf_page *, enum pdf_annot_type, pdf_annot *);
 ]]

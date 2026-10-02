@@ -1114,9 +1114,27 @@ function page_mt.__index:updateEmbeddedAnnotation(part, changes)
     return annotation_part(assert(read_source_annotation(self, annot)), self.number)
 end
 
-function page_mt.__index:createEmbeddedAnnotation(raw)
+function page_mt.__index:createEmbeddedAnnotation(raw, template_part)
     assert(raw.type and raw.type >= 8 and raw.type <= 11, "expected text markup annotation")
-    local annot = W.mupdf_pdf_create_annot(self.ctx, ffi.cast("pdf_page*", self.page), raw.type)
+    local annot
+    if template_part then
+        -- Borrow the source pointer only while its page is open. Both pages
+        -- belong to the independent candidate document, never the live reader.
+        local source_page = self.doc:openPage(assert(template_part.page))
+        local ok, result = pcall(function()
+            local original, reason = source_page:resolveEmbeddedAnnotation(template_part)
+            assert(original, reason)
+            local created = W.mupdf_pdf_create_annot_from(self.ctx,
+                ffi.cast("pdf_page*", self.page), raw.type, original)
+            if created == nil then merror(self.ctx, "could not extend source annotation") end
+            return created
+        end)
+        source_page:close()
+        assert(ok, result)
+        annot = result
+    else
+        annot = W.mupdf_pdf_create_annot(self.ctx, ffi.cast("pdf_page*", self.page), raw.type)
+    end
     if annot == nil then merror(self.ctx, "could not create source annotation") end
     apply_annotation_changes(self, annot, raw)
     return annotation_part(assert(read_source_annotation(self, annot)), self.number)

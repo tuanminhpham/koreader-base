@@ -362,3 +362,41 @@ mupdf_pdf_set_markup_type(fz_context *ctx, pdf_annot *annot, int type)
     fz_catch(ctx) { return false; }
     return true;
 }
+
+
+DLL_PUBLIC pdf_annot *
+mupdf_pdf_create_annot_from(fz_context *ctx, pdf_page *page, enum pdf_annot_type type, pdf_annot *source)
+{
+    pdf_annot *created = NULL;
+    fz_var(created);
+    fz_try(ctx)
+    {
+        pdf_page *source_page = pdf_annot_page(ctx, source);
+        if (!source_page || source_page->doc != page->doc)
+            fz_throw(ctx, FZ_ERROR_ARGUMENT, "annotation template must belong to this PDF");
+        pdf_obj *original = pdf_annot_obj(ctx, source);
+        // These relationships bind to another annotation or popup on the old
+        // page. Never share them across newly extended parts accidentally.
+        const char *relationships[] = { "Popup", "IRT", "RT", "Parent", "StructParent" };
+        for (size_t i = 0; i < sizeof(relationships)/sizeof(relationships[0]); ++i)
+            if (pdf_dict_gets(ctx, original, relationships[i]))
+                fz_throw(ctx, FZ_ERROR_ARGUMENT,
+                    "cannot extend annotation containing relationship /%s", relationships[i]);
+        created = pdf_create_annot(ctx, page, type);
+        pdf_obj *destination = pdf_annot_obj(ctx, created);
+        for (int i = 0; i < pdf_dict_len(ctx, original); ++i) {
+            pdf_obj *key = pdf_dict_get_key(ctx, original, i);
+            const char *name = pdf_to_name(ctx, key);
+            // New part has its own page, geometry, appearance and identity.
+            // Other keys (including unknown dictionaries and indirect values)
+            // stay in this same document and retain their exact PDF objects.
+            if (!strcmp(name, "P") || !strcmp(name, "Rect") || !strcmp(name, "AP") ||
+                !strcmp(name, "QuadPoints") || !strcmp(name, "Subtype") || !strcmp(name, "NM"))
+                continue;
+            pdf_dict_put(ctx, destination, key, pdf_dict_get_val(ctx, original, i));
+        }
+        pdf_dirty_annot(ctx, created);
+    }
+    fz_catch(ctx) { return NULL; }
+    return created;
+}

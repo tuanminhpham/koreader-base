@@ -51,6 +51,8 @@ DLL_PUBLIC bool mupdf_pdf_annot_color_info(fz_context *ctx, pdf_annot *annot,
     int *n, float components[4], float rgb[3]);
 DLL_PUBLIC bool mupdf_pdf_annot_identity(fz_context *ctx, pdf_annot *annot, int *num, int *gen);
 DLL_PUBLIC bool mupdf_pdf_set_markup_type(fz_context *ctx, pdf_annot *annot, int type);
+DLL_PUBLIC pdf_annot *mupdf_pdf_create_annot_from(fz_context *ctx, pdf_page *page,
+    enum pdf_annot_type type, pdf_annot *source);
 
 // this will turn the wrappers defined below into their declarations
 #define MUPDF_WRAP(wrapper_name, ret_type, failure_value, call, ...) \
