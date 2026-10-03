@@ -833,6 +833,7 @@ function page_mt.__index:addMarkupAnnotation(points, n, type, bb_color)
     for i = 0, n-1 do
         W.mupdf_pdf_annot_quad_point(self.ctx, annot, i, points+i)
     end
+    return self:getMarkupAnnotationSource(annot)
 end
 
 -- Add an ink annotation (/Subtype /Ink) built from one or more freehand strokes.
@@ -925,6 +926,7 @@ end
 function page_mt.__index:updateMarkupAnnotation(annot, contents)
     local ok = W.mupdf_pdf_set_annot_contents(self.ctx, annot, contents)
     if not ok then merror(self.ctx, "could not update markup annot contents") end
+    return self:getMarkupAnnotationSource(annot)
 end
 
 -- Snapshot the current in-memory PDF without finalizing its incremental xref.
@@ -1013,6 +1015,12 @@ local function read_source_annotation(page, annot)
         source = { num = num[0], gen = gen[0] }, raw = raw }
 end
 
+-- Snapshot a known created/updated pointer while its page is still open.
+-- Ordinary callers use this provenance without searching by shared geometry.
+function page_mt.__index:getMarkupAnnotationSource(annot)
+    return assert(read_source_annotation(self, annot))
+end
+
 -- Only serializable values leave this function. An invalid annotation is reported
 -- separately, never committed as a malformed item by an importing caller.
 function page_mt.__index:getEmbeddedAnnotations()
@@ -1029,7 +1037,7 @@ end
 
 -- A pointer is borrowed only for this open page's lifetime. A same-ID changed
 -- source is a conflict; rewritten IDs may fall back to ONE complete raw match.
-function page_mt.__index:resolveEmbeddedAnnotation(part)
+function page_mt.__index:resolveEmbeddedAnnotation(part, exact_identity)
     if type(part) ~= "table" or type(part.raw) ~= "table" then
         return nil, "source snapshot missing"
     end
@@ -1047,6 +1055,7 @@ function page_mt.__index:resolveEmbeddedAnnotation(part)
         end
         annot = W.mupdf_pdf_next_annot(self.ctx, annot)
     end
+    if exact_identity then return nil, "owned source identity is missing" end
     if matches == 1 then return found, found_entry end
     return nil, matches == 0 and "source annotation missing" or "ambiguous source annotations"
 end
@@ -1140,8 +1149,8 @@ function page_mt.__index:createEmbeddedAnnotation(raw, template_part)
     return annotation_part(assert(read_source_annotation(self, annot)), self.number)
 end
 
-function page_mt.__index:deleteEmbeddedAnnotation(part)
-    local annot, reason = self:resolveEmbeddedAnnotation(part)
+function page_mt.__index:deleteEmbeddedAnnotation(part, exact_identity)
+    local annot, reason = self:resolveEmbeddedAnnotation(part, exact_identity)
     if not annot then error(reason) end
     self:deleteAnnotation(annot)
     return true
