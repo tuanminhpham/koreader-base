@@ -177,9 +177,7 @@ MUPDF_WRAP(mupdf_pdf_annot_contents, const char*, NULL,
 MUPDF_WRAP(mupdf_pdf_create_annot, pdf_annot*, NULL,
     ret = pdf_create_annot(ctx, page, type),
     pdf_page *page, enum pdf_annot_type type)
-MUPDF_WRAP_BOOL(mupdf_pdf_delete_annot,
-    pdf_delete_annot(ctx, page, annot),
-    pdf_page *page, pdf_annot *annot)
+DLL_PUBLIC bool mupdf_pdf_delete_annot(fz_context *ctx, pdf_page *page, pdf_annot *annot);
 MUPDF_WRAP_BOOL(mupdf_pdf_set_annot_quad_points,
     pdf_set_annot_quad_points(ctx, annot, n, qv),
     pdf_annot *annot, int n, const fz_quad *qv)

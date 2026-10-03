@@ -129,9 +129,9 @@ describe("KOReaderX PDF source annotations", function()
         local relationship_target = relationship_doc:openPage(2)
         local accepted, relationship_error = pcall(relationship_target.createEmbeddedAnnotation,
             relationship_target, relationship_entry.raw, relationship_part)
-        eq(accepted, false, 'cross-page annotation relationships require explicit reconciliation')
-        assert(tostring(relationship_error):find('relationship /IRT', 1, true))
-        eq(relationship_target:getEmbeddedAnnotations(), nil, 'rejected relationship does not create a part')
+        eq(accepted, true, 'cross-page replies preserve the document-local relationship')
+        eq(relationship_error.page, 2)
+        eq(#relationship_target:getEmbeddedAnnotations(), 1, 'reply template creates one added part')
         relationship_target:close(); relationship_page:close(); relationship_doc:close()
 
         print('PASS native metadata RGB/gray/CMYK/no-color, UTF-8 author/note, identity/stale/ambiguous, snapshot pending edits, exact selective render including widget, tilted quad bounds, type/foreign-field/opacity/date roundtrip')

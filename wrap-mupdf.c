@@ -22,6 +22,7 @@
 #include <math.h>
 #include <stddef.h>
 #include <string.h>
+#include <limits.h>
 #include "wrap-mupdf.h"
 
 static double LOG_TRESHOLD_PERC = 0.05; // 5%
@@ -364,6 +365,218 @@ mupdf_pdf_set_markup_type(fz_context *ctx, pdf_annot *annot, int type)
 }
 
 
+/* PDF annotation relationships stay within one candidate document. A reply may
+ * refer to a markup on another page; a popup and a structure-parent key cannot
+ * be shared because each must identify exactly one annotation. */
+static void
+annotation_number_tree_bounds(fz_context *ctx, pdf_obj *node, int depth, int *first, int *last)
+{
+    if (depth > 64 || !pdf_is_dict(ctx, node))
+        fz_throw(ctx, FZ_ERROR_ARGUMENT, "invalid or cyclic annotation ParentTree");
+    pdf_obj *kids = pdf_dict_get(ctx, node, PDF_NAME(Kids));
+    pdf_obj *nums = pdf_dict_get(ctx, node, PDF_NAME(Nums));
+    int count = pdf_array_len(ctx, kids);
+    *first = *last = -1;
+    if (kids) {
+        if (!pdf_is_array(ctx, kids) || nums || count == 0)
+            fz_throw(ctx, FZ_ERROR_ARGUMENT, "invalid annotation ParentTree Kids");
+        for (int i = 0; i < count; ++i) {
+            int low, high;
+            annotation_number_tree_bounds(ctx, pdf_array_get(ctx, kids, i), depth + 1, &low, &high);
+            if (low < 0 || (i && low <= *last))
+                fz_throw(ctx, FZ_ERROR_ARGUMENT, "unordered annotation ParentTree Kids");
+            if (i == 0) *first = low;
+            *last = high;
+        }
+    } else {
+        count = pdf_array_len(ctx, nums);
+        if (!pdf_is_array(ctx, nums) || count % 2)
+            fz_throw(ctx, FZ_ERROR_ARGUMENT, "invalid annotation ParentTree Nums");
+        for (int i = 0; i < count; i += 2) {
+            pdf_obj *key = pdf_array_get(ctx, nums, i);
+            int value = pdf_to_int(ctx, key);
+            if (!pdf_is_int(ctx, key) || value < 0 || (i && value <= *last))
+                fz_throw(ctx, FZ_ERROR_ARGUMENT, "unordered annotation ParentTree Nums");
+            if (i == 0) *first = value;
+            *last = value;
+        }
+    }
+}
+
+static void
+annotation_number_tree_limits(fz_context *ctx, pdf_obj *node, int first, int last)
+{
+    if (first < 0) {
+        pdf_dict_del(ctx, node, PDF_NAME(Limits));
+    } else {
+        pdf_obj *limits = pdf_dict_put_array(ctx, node, PDF_NAME(Limits), 2);
+        pdf_array_push_int(ctx, limits, first);
+        pdf_array_push_int(ctx, limits, last);
+    }
+}
+
+/* Append a key larger than every current key. Keep existing tree objects and
+ * other entries (including page marked-content arrays) intact. */
+static void
+annotation_number_tree_append(fz_context *ctx, pdf_obj *node, int key, pdf_obj *value)
+{
+    pdf_obj *kids = pdf_dict_get(ctx, node, PDF_NAME(Kids));
+    if (kids) {
+        annotation_number_tree_append(ctx, pdf_array_get(ctx, kids, pdf_array_len(ctx, kids) - 1), key, value);
+    } else {
+        pdf_obj *nums = pdf_dict_get(ctx, node, PDF_NAME(Nums));
+        pdf_array_push_int(ctx, nums, key);
+        pdf_array_push(ctx, nums, value);
+    }
+    int first, last;
+    annotation_number_tree_bounds(ctx, node, 0, &first, &last);
+    annotation_number_tree_limits(ctx, node, first, last);
+}
+
+static int
+annotation_number_tree_remove(fz_context *ctx, pdf_obj *node, int key)
+{
+    pdf_obj *kids = pdf_dict_get(ctx, node, PDF_NAME(Kids));
+    if (kids) {
+        for (int i = 0; i < pdf_array_len(ctx, kids); ++i) {
+            if (annotation_number_tree_remove(ctx, pdf_array_get(ctx, kids, i), key))
+                pdf_array_delete(ctx, kids, i--);
+        }
+        if (!pdf_array_len(ctx, kids)) {
+            pdf_dict_del(ctx, node, PDF_NAME(Kids));
+            pdf_dict_put_array(ctx, node, PDF_NAME(Nums), 0);
+        }
+    } else {
+        pdf_obj *nums = pdf_dict_get(ctx, node, PDF_NAME(Nums));
+        for (int i = 0; i < pdf_array_len(ctx, nums); i += 2) {
+            if (pdf_array_get_int(ctx, nums, i) == key) {
+                pdf_array_delete(ctx, nums, i);
+                pdf_array_delete(ctx, nums, i);
+                break;
+            }
+        }
+    }
+    int first, last;
+    annotation_number_tree_bounds(ctx, node, 0, &first, &last);
+    annotation_number_tree_limits(ctx, node, first, last);
+    return first < 0;
+}
+
+static int
+annotation_objr_matches(fz_context *ctx, pdf_obj *kid, pdf_obj *annotation)
+{
+    return pdf_is_dict(ctx, kid) && !strcmp(pdf_dict_get_name(ctx, kid, PDF_NAME(Type)), "OBJR") &&
+        !pdf_objcmp(ctx, pdf_dict_gets(ctx, kid, "Obj"), annotation);
+}
+
+/* Validate the bidirectional structure link before any candidate mutation. */
+static pdf_obj *
+annotation_structure(fz_context *ctx, pdf_document *doc, pdf_obj *annotation,
+    pdf_obj **root, pdf_obj **tree, int *key)
+{
+    pdf_obj *parent_key = pdf_dict_get(ctx, annotation, PDF_NAME(StructParent));
+    if (!parent_key) return NULL;
+    if (!pdf_is_int(ctx, parent_key) || (*key = pdf_to_int(ctx, parent_key)) < 0)
+        fz_throw(ctx, FZ_ERROR_ARGUMENT, "invalid annotation StructParent key");
+    *root = pdf_dict_gets(ctx, pdf_dict_get(ctx, pdf_trailer(ctx, doc), PDF_NAME(Root)), "StructTreeRoot");
+    *tree = pdf_dict_get(ctx, *root, PDF_NAME(ParentTree));
+    int first, last;
+    annotation_number_tree_bounds(ctx, *tree, 0, &first, &last);
+    pdf_obj *element = pdf_lookup_number(ctx, *tree, *key);
+    if (!pdf_is_dict(ctx, element))
+        fz_throw(ctx, FZ_ERROR_ARGUMENT, "annotation StructParent has no structure element");
+    pdf_obj *kids = pdf_dict_get(ctx, element, PDF_NAME(K));
+    int matches = annotation_objr_matches(ctx, kids, annotation);
+    if (pdf_is_array(ctx, kids))
+        for (int i = 0; i < pdf_array_len(ctx, kids); ++i)
+            matches += annotation_objr_matches(ctx, pdf_array_get(ctx, kids, i), annotation);
+    if (matches != 1)
+        fz_throw(ctx, FZ_ERROR_ARGUMENT, "annotation StructParent must have one matching OBJR");
+    return element;
+}
+
+static void
+annotation_copy_structure(fz_context *ctx, pdf_page *page, pdf_obj *destination,
+    pdf_obj *root, pdf_obj *tree, pdf_obj *element)
+{
+    int first, last;
+    annotation_number_tree_bounds(ctx, tree, 0, &first, &last);
+    int next = pdf_to_int(ctx, pdf_dict_gets(ctx, root, "ParentTreeNextKey"));
+    if (last == INT_MAX || next == INT_MAX)
+        fz_throw(ctx, FZ_ERROR_ARGUMENT, "annotation ParentTree key space exhausted");
+    if (next <= last) next = last + 1;
+    if (next < 0) next = 0;
+    pdf_obj *old_kids = pdf_dict_get(ctx, element, PDF_NAME(K));
+    pdf_obj *kids = pdf_is_array(ctx, old_kids) ? pdf_copy_array(ctx, old_kids) : pdf_new_array(ctx, page->doc, 2);
+    pdf_obj *objr = NULL;
+    fz_var(objr);
+    fz_try(ctx) {
+        if (!pdf_is_array(ctx, old_kids)) pdf_array_push(ctx, kids, old_kids);
+        objr = pdf_new_dict(ctx, page->doc, 3);
+        pdf_dict_put_name(ctx, objr, PDF_NAME(Type), "OBJR");
+        pdf_dict_puts(ctx, objr, "Obj", destination);
+        pdf_dict_puts(ctx, objr, "Pg", page->obj);
+        pdf_array_push(ctx, kids, objr);
+        pdf_dict_put(ctx, element, PDF_NAME(K), kids);
+        annotation_number_tree_append(ctx, tree, next, element);
+        pdf_dict_put_int(ctx, destination, PDF_NAME(StructParent), next);
+        pdf_dict_puts_drop(ctx, root, "ParentTreeNextKey", pdf_new_int(ctx, next + 1));
+    }
+    fz_always(ctx) { pdf_drop_obj(ctx, kids); pdf_drop_obj(ctx, objr); }
+    fz_catch(ctx) { fz_rethrow(ctx); }
+}
+
+static void
+annotation_remove_structure(fz_context *ctx, pdf_document *doc, pdf_obj *original)
+{
+    pdf_obj *root = NULL, *tree = NULL;
+    int key = -1;
+    pdf_obj *element = annotation_structure(ctx, doc, original, &root, &tree, &key);
+    if (!element) return;
+    pdf_obj *kids = pdf_dict_get(ctx, element, PDF_NAME(K));
+    if (pdf_is_array(ctx, kids)) {
+        for (int i = 0; i < pdf_array_len(ctx, kids); ++i)
+            if (annotation_objr_matches(ctx, pdf_array_get(ctx, kids, i), original))
+                pdf_array_delete(ctx, kids, i--);
+    } else {
+        pdf_dict_del(ctx, element, PDF_NAME(K));
+    }
+    annotation_number_tree_remove(ctx, tree, key);
+    pdf_dict_del(ctx, original, PDF_NAME(StructParent));
+}
+
+DLL_PUBLIC bool
+mupdf_pdf_delete_annot(fz_context *ctx, pdf_page *page, pdf_annot *annot)
+{
+    if (!annot) return true;
+    fz_try(ctx) {
+        if (pdf_annot_page(ctx, annot) != page)
+            fz_throw(ctx, FZ_ERROR_ARGUMENT, "annotation belongs to another page");
+        pdf_obj *original = pdf_annot_obj(ctx, annot);
+        annotation_remove_structure(ctx, page->doc, original);
+        annotation_remove_structure(ctx, page->doc, pdf_dict_get(ctx, original, PDF_NAME(Popup)));
+        pdf_delete_annot(ctx, page, annot);
+    }
+    fz_catch(ctx) { return false; }
+    return true;
+}
+
+static void
+annotation_validate_reply(fz_context *ctx, pdf_obj *annotation, int depth)
+{
+    pdf_obj *reply = pdf_dict_get(ctx, annotation, PDF_NAME(IRT));
+    if (!reply) return;
+    if (depth > 64 || !pdf_is_dict(ctx, reply) ||
+        !pdf_is_name(ctx, pdf_dict_get(ctx, reply, PDF_NAME(Subtype))) ||
+        (pdf_dict_get(ctx, reply, PDF_NAME(Type)) &&
+            !pdf_name_eq(ctx, pdf_dict_get(ctx, reply, PDF_NAME(Type)), PDF_NAME(Annot))))
+        fz_throw(ctx, FZ_ERROR_ARGUMENT, "invalid, cyclic or overly deep annotation reply chain");
+    const char *kind = pdf_to_name(ctx, pdf_dict_get(ctx, annotation, PDF_NAME(RT)));
+    if (*kind && strcmp(kind, "R") && strcmp(kind, "Group"))
+        fz_throw(ctx, FZ_ERROR_ARGUMENT, "invalid annotation reply type");
+    annotation_validate_reply(ctx, reply, depth + 1);
+}
+
 DLL_PUBLIC pdf_annot *
 mupdf_pdf_create_annot_from(fz_context *ctx, pdf_page *page, enum pdf_annot_type type, pdf_annot *source)
 {
@@ -374,27 +587,46 @@ mupdf_pdf_create_annot_from(fz_context *ctx, pdf_page *page, enum pdf_annot_type
         pdf_page *source_page = pdf_annot_page(ctx, source);
         if (!source_page || source_page->doc != page->doc)
             fz_throw(ctx, FZ_ERROR_ARGUMENT, "annotation template must belong to this PDF");
-        pdf_obj *original = pdf_annot_obj(ctx, source);
-        // These relationships bind to another annotation or popup on the old
-        // page. Never share them across newly extended parts accidentally.
-        const char *relationships[] = { "Popup", "IRT", "RT", "Parent", "StructParent" };
-        for (size_t i = 0; i < sizeof(relationships)/sizeof(relationships[0]); ++i)
-            if (pdf_dict_gets(ctx, original, relationships[i]))
-                fz_throw(ctx, FZ_ERROR_ARGUMENT,
-                    "cannot extend annotation containing relationship /%s", relationships[i]);
+        pdf_obj *original = pdf_annot_obj(ctx, source), *root = NULL, *tree = NULL;
+        annotation_validate_reply(ctx, original, 0);
+        int key = -1;
+        pdf_obj *element = annotation_structure(ctx, page->doc, original, &root, &tree, &key);
+        pdf_obj *popup = pdf_dict_get(ctx, original, PDF_NAME(Popup));
+        if (popup && (!pdf_name_eq(ctx, pdf_dict_get(ctx, popup, PDF_NAME(Subtype)), PDF_NAME(Popup)) ||
+            (pdf_dict_get(ctx, popup, PDF_NAME(Parent)) && pdf_objcmp(ctx, pdf_dict_get(ctx, popup, PDF_NAME(Parent)), original))))
+            fz_throw(ctx, FZ_ERROR_ARGUMENT, "invalid source annotation Popup/Parent relationship");
+        pdf_obj *popup_root = NULL, *popup_tree = NULL;
+        int popup_key = -1;
+        pdf_obj *popup_element = annotation_structure(ctx, page->doc, popup,
+            &popup_root, &popup_tree, &popup_key);
         created = pdf_create_annot(ctx, page, type);
         pdf_obj *destination = pdf_annot_obj(ctx, created);
         for (int i = 0; i < pdf_dict_len(ctx, original); ++i) {
-            pdf_obj *key = pdf_dict_get_key(ctx, original, i);
-            const char *name = pdf_to_name(ctx, key);
-            // New part has its own page, geometry, appearance and identity.
-            // Other keys (including unknown dictionaries and indirect values)
-            // stay in this same document and retain their exact PDF objects.
+            pdf_obj *field = pdf_dict_get_key(ctx, original, i);
+            const char *name = pdf_to_name(ctx, field);
             if (!strcmp(name, "P") || !strcmp(name, "Rect") || !strcmp(name, "AP") ||
-                !strcmp(name, "QuadPoints") || !strcmp(name, "Subtype") || !strcmp(name, "NM"))
+                !strcmp(name, "QuadPoints") || !strcmp(name, "Subtype") || !strcmp(name, "NM") ||
+                !strcmp(name, "Popup") || !strcmp(name, "StructParent"))
                 continue;
-            pdf_dict_put(ctx, destination, key, pdf_dict_get_val(ctx, original, i));
+            // IRT/RT refer to the same existing conversation; an unknown Parent
+            // field and all other unknown keys keep their document-local refs.
+            pdf_dict_put(ctx, destination, field, pdf_dict_get_val(ctx, original, i));
         }
+        pdf_dict_put(ctx, destination, PDF_NAME(P), page->obj);
+        if (popup) {
+            pdf_set_annot_popup(ctx, created, pdf_annot_popup(ctx, source));
+            pdf_obj *new_popup = pdf_dict_get(ctx, destination, PDF_NAME(Popup));
+            for (int i = 0; i < pdf_dict_len(ctx, popup); ++i) {
+                pdf_obj *field = pdf_dict_get_key(ctx, popup, i);
+                const char *name = pdf_to_name(ctx, field);
+                if (!strcmp(name, "P") || !strcmp(name, "Parent") || !strcmp(name, "Rect") ||
+                    !strcmp(name, "AP") || !strcmp(name, "NM") || !strcmp(name, "StructParent")) continue;
+                pdf_dict_put(ctx, new_popup, field, pdf_dict_get_val(ctx, popup, i));
+            }
+            pdf_dict_put(ctx, new_popup, PDF_NAME(P), page->obj);
+            if (popup_element) annotation_copy_structure(ctx, page, new_popup, popup_root, popup_tree, popup_element);
+        }
+        if (element) annotation_copy_structure(ctx, page, destination, root, tree, element);
         pdf_dirty_annot(ctx, created);
     }
     fz_catch(ctx) { return NULL; }
